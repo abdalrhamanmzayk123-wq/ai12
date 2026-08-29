@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 import fs from "node:fs/promises";
-import { mkdirSync } from "node:fs";
+import { mkdirSync, readFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { spawn } from "node:child_process";
@@ -93,6 +93,8 @@ export function ensureWindowsBuildProfileDirs(env, mkdirImpl = mkdirSync) {
 
 function runNextBuild() {
   return new Promise((resolve) => {
+    // .env bundler flag fill-in before the arg is constructed (see helper doc).
+    honorBundlerFlagFromEnvFile();
     const nextBin = path.join(projectRoot, "node_modules", "next", "dist", "bin", "next");
     const buildEnv = resolveNextBuildEnv(process.env);
     ensureWindowsBuildProfileDirs(buildEnv);
@@ -130,16 +132,66 @@ function runNextBuild() {
   });
 }
 
-export function resolveNextBuildBundlerFlag(baseEnv = process.env) {
+/**
+ * True where Turbopack is known not to converge: Apple silicon on Next 16.3.2 (#12059).
+ * `next build` never completes (25 min+ with no progress, chunks pinned at 20) and
+ * `next dev` never reaches listen state, while the same commits build green in CI on
+ * Linux x64. Narrow on purpose — Intel Macs are untouched, so this does not penalise
+ * platforms we have not measured.
+ */
+export function isTurbopackStallPlatform(platform = process.platform, arch = process.arch) {
+  return platform === "darwin" && arch === "arm64";
+}
+
+export function resolveNextBuildBundlerFlag(
+  baseEnv = process.env,
+  platform = process.platform,
+  arch = process.arch
+) {
   // Turbopack is the default; OMNIROUTE_USE_TURBOPACK=0 is the documented escape hatch
   // to webpack (Windows, native-binding trouble, RAM-constrained machines — #6409, and
-  // docs/reference/ENVIRONMENT.md). The choice is env-only ON PURPOSE: the variable is
-  // the operator's control and CI sets it explicitly, so sniffing the runtime here would
-  // silently override an operator who asked for Turbopack.
+  // docs/reference/ENVIRONMENT.md). The variable is the operator's control and CI sets
+  // it explicitly, so an explicit value always wins below and runtime sniffing never
+  // overrides an operator who asked for Turbopack.
+  //
+  // What changed (#12059): the platform now selects the DEFAULT when nobody asked. On
+  // Apple silicon, picking Turbopack by default means a build that silently never
+  // finishes, which is worse than the slower-but-reliable webpack path (13 min).
+  // Operators who want Turbopack back set OMNIROUTE_USE_TURBOPACK=1 explicitly.
   if (baseEnv.OMNIROUTE_USE_TURBOPACK === "0") {
     return "--webpack";
   }
+  if (baseEnv.OMNIROUTE_USE_TURBOPACK !== undefined) {
+    return "--turbopack";
+  }
+  if (isTurbopackStallPlatform(platform, arch)) {
+    return "--webpack";
+  }
   return "--turbopack";
+}
+
+// Honor OMNIROUTE_USE_TURBOPACK from the repo `.env` on the BUILD path too.
+// Unlike the dev server (scripts/dev/run-next.mjs → bootstrapEnv()), this script
+// never loads .env, so the documented escape hatch set there — the exact remedy
+// for the #6409/#9695 RAM-constrained / macOS arm64 local-stall cases — was
+// silently ignored by `npm run build`: .env said 0 but the build still ran
+// Turbopack and stalled (2026-08-29 local investigation). Shell env wins;
+// .env only fills the variable in when it is absent (ports the DATA_DIR
+// pre-read pattern from run-next.mjs).
+// @param {NodeJS.ProcessEnv} [env]
+// @param {string} [cwd]
+export function honorBundlerFlagFromEnvFile(env = process.env, cwd = process.cwd()) {
+  if (env.OMNIROUTE_USE_TURBOPACK !== undefined) return env.OMNIROUTE_USE_TURBOPACK ?? null;
+  try {
+    const raw = readFileSync(path.join(cwd, ".env"), "utf8");
+    const match = raw.match(/^OMNIROUTE_USE_TURBOPACK=(\S+)\s*$/m);
+    if (match?.[1]) {
+      env.OMNIROUTE_USE_TURBOPACK = match[1].trim();
+    }
+  } catch {
+    /* .env missing or unreadable — shell env stays authoritative */
+  }
+  return env.OMNIROUTE_USE_TURBOPACK ?? null;
 }
 
 /**
