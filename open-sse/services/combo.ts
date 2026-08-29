@@ -229,6 +229,7 @@ export {
   isModelScoped400,
 };
 import { applyComboTargetExhaustion } from "./combo/targetExhaustion.ts";
+import { clearLKGPOnExhaustion } from "./combo/lkgpClearing.ts";
 import {
   applyNativeCodexTurnPin,
   getNativeCodexTurnPin,
@@ -2183,6 +2184,19 @@ async function handleComboChatInner({
           // rather than waiting for the next turn's lazy headroom/status recheck.
           releaseStickyPinOnFailure(_sticky.messageHash, targetWithConnection.connectionId);
 
+          // #11911: when the provider/connection is marked exhausted (providerExhausted
+          // or the connection added to exhaustedConnections), clear the LKGP pin so
+          // the next request doesn't re-select the same dead provider first.
+          void clearLKGPOnExhaustion({
+            comboName: combo.name,
+            comboKey: combo.id || combo.name,
+            target: targetWithConnection,
+            providerExhausted,
+            exhaustedConnections,
+            log,
+            tag: "COMBO",
+          });
+
           // #2101: Prevent infinite fallback loops with 400 Bad Request errors that are genuinely
           // body-specific (malformed JSON, bad format, missing required fields).
           // These should NOT stop the combo:
@@ -3711,6 +3725,19 @@ async function handleRoundRobinCombo({
             _rrSessionSticky.messageHash,
             targetWithConnection.connectionId
           );
+
+          // #11911: when the provider/connection is marked exhausted (providerExhausted
+          // or the connection added to exhaustedConnections), clear the LKGP pin so
+          // the next request doesn't re-select the same dead provider first.
+          void clearLKGPOnExhaustion({
+            comboName: combo.name,
+            comboKey: combo.id || combo.name,
+            target: targetWithConnection,
+            providerExhausted,
+            exhaustedConnections,
+            log,
+            tag: "COMBO-RR",
+          });
 
           // Transient errors → mark in semaphore so round-robin stops stampeding this target.
           if (
